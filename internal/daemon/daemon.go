@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/gofrs/flock"
+	"github.com/google/uuid"
 	beadsdk "github.com/steveyegge/beads"
 	"gopkg.in/natefinch/lumberjack.v2"
 	"github.com/steveyegge/gastown/internal/beads"
@@ -1919,16 +1920,25 @@ func (d *Daemon) restartPolecatSession(rigName, polecatName, sessionName string)
 	// Pre-sync workspace (ensure beads are current)
 	d.syncWorkspace(workDir)
 
+	// Generate a fresh run ID for this restart so all telemetry from the
+	// crash-restarted session is correlated under a new GASTA root span.
+	runID := uuid.New().String()
+
 	// Build startup command BEFORE creating the session so we can use
 	// NewSessionWithCommand (command as initial pane process). This eliminates
 	// the race condition in the old EnsureSessionFresh + SendKeys pattern where
 	// the shell might not be ready to receive keystrokes, producing empty windows.
 	envVars := config.AgentEnv(config.AgentEnvConfig{
-		Role:      "polecat",
-		Rig:       rigName,
-		AgentName: polecatName,
-		TownRoot:  d.config.TownRoot,
+		Role:        "polecat",
+		Rig:         rigName,
+		AgentName:   polecatName,
+		TownRoot:    d.config.TownRoot,
+		SessionName: sessionName,
 	})
+	// Inject GT_RUN into envVars before BuildStartupCommand so the startup
+	// command includes it (exec env …) and the loop below propagates it to
+	// the tmux session environment.
+	envVars["GT_RUN"] = runID
 	rc := config.ResolveRoleAgentConfig("polecat", d.config.TownRoot, rigPath)
 	startCmd := config.BuildStartupCommand(envVars, rigPath, "")
 
