@@ -634,9 +634,10 @@ func runRefineryUnclaimed(cmd *cobra.Command, args []string) error {
 	// Query beads for merge-request issues without assignee
 	b := beads.New(r.Path)
 	issues, err := b.List(beads.ListOptions{
-		Status:   "open",
-		Label:    "gt:merge-request",
-		Priority: -1,
+		Status:    "open",
+		Label:     "gt:merge-request",
+		Priority:  -1,
+		Ephemeral: true, // MR beads are wisps — search wisps table (GH#2446)
 	})
 	if err != nil {
 		return fmt.Errorf("listing merge requests: %w", err)

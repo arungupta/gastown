@@ -589,10 +589,12 @@ func getCleanupStatus(bd *BdCli, workDir, rigName, polecatName string) string {
 // branch field matches the given branch name. Returns the bead ID if found,
 // or empty string if no matching MR bead exists.
 func findMRBeadForBranch(bd *BdCli, workDir, branch string) string {
-	// Use --desc-contains to filter at the bd level instead of fetching all MR beads
-	output, err := bd.Exec(workDir, "list",
-		"--type=merge-request", "--status=open", "--json", "--limit=0",
-		"--desc-contains", "branch: "+branch)
+	// Use "bd query" with ephemeral=true to search the wisps table where
+	// MR beads live (GH#2446). "bd list --type=merge-request" only searches
+	// the issues table and misses wisps.
+	output, err := bd.Exec(workDir, "query",
+		"ephemeral=true AND label=gt:merge-request AND status=open",
+		"--json")
 	if err != nil || output == "" || output == "[]" || output == "null" {
 		return ""
 	}

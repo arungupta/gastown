@@ -35,6 +35,19 @@ func TestListOptions(t *testing.T) {
 	}
 }
 
+// TestListOptionsEphemeral verifies that Ephemeral flag is preserved.
+func TestListOptionsEphemeral(t *testing.T) {
+	opts := ListOptions{
+		Label:     "gt:merge-request",
+		Status:    "open",
+		Priority:  -1,
+		Ephemeral: true,
+	}
+	if !opts.Ephemeral {
+		t.Error("Ephemeral should be true")
+	}
+}
+
 // TestCreateOptions verifies CreateOptions fields.
 func TestCreateOptions(t *testing.T) {
 	opts := CreateOptions{

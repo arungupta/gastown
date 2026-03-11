@@ -260,9 +260,10 @@ func (m *Manager) Queue() ([]QueueItem, error) {
 	// BeadsPath() returns the git-synced beads location
 	b := beads.New(m.rig.BeadsPath())
 	issues, err := b.List(beads.ListOptions{
-		Label:    "gt:merge-request",
-		Status:   "open",
-		Priority: -1, // No priority filter
+		Label:     "gt:merge-request",
+		Status:    "open",
+		Priority:  -1, // No priority filter
+		Ephemeral: true, // MR beads are wisps — search wisps table (GH#2446)
 	})
 	if err != nil {
 		return nil, fmt.Errorf("querying merge queue from beads: %w", err)

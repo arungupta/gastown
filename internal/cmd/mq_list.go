@@ -35,11 +35,15 @@ func runMQList(cmd *cobra.Command, args []string) error {
 		gitClient = git.NewGit(refineryRigPath)
 	}
 
-	// Build list options - query for merge-request label
-	// Priority -1 means no priority filter (otherwise 0 would filter to P0 only)
+	// Build list options - query for merge-request label.
+	// Ephemeral=true routes the query to the wisps table via "bd query"
+	// instead of "bd list", which only searches the issues table (GH#2446).
+	// MR beads are created as ephemeral (wisps) and live in a separate table.
+	// Priority -1 means no priority filter (otherwise 0 would filter to P0 only).
 	opts := beads.ListOptions{
-		Label:    "gt:merge-request",
-		Priority: -1,
+		Label:     "gt:merge-request",
+		Priority:  -1,
+		Ephemeral: true,
 	}
 
 	// Apply status filter if specified

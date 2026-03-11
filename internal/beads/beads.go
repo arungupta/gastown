@@ -228,6 +228,7 @@ type ListOptions struct {
 	Assignee   string // filter by assignee (e.g., "gastown/Toast")
 	NoAssignee bool   // filter for issues with no assignee
 	Limit      int    // Max results (0 = unlimited, overrides bd default of 50)
+	Ephemeral  bool   // Search wisps table (ephemeral issues) instead of issues table
 }
 
 // CreateOptions specifies options for creating an issue.
@@ -582,7 +583,14 @@ func stripEnvPrefixes(environ []string, prefixes ...string) []string {
 }
 
 // List returns issues matching the given options.
+// When Ephemeral is true, uses "bd query" with ephemeral=true to search the
+// wisps table (where ephemeral issues live in beads v0.59+). Without this,
+// "bd list" only searches the issues table and misses wisps entirely.
 func (b *Beads) List(opts ListOptions) ([]*Issue, error) {
+	if opts.Ephemeral {
+		return b.listEphemeral(opts)
+	}
+
 	// --flat is required because bd's default tree mode doesn't output valid JSON
 	// even when --json is specified. This was introduced when bd added tree view.
 	args := []string{"list", "--json", "--flat"}
@@ -639,6 +647,59 @@ func (b *Beads) List(opts ListOptions) ([]*Issue, error) {
 	var issues []*Issue
 	if err := json.Unmarshal(out, &issues); err != nil {
 		return nil, fmt.Errorf("parsing bd list output: %w", err)
+	}
+
+	return issues, nil
+}
+
+// listEphemeral searches the wisps table using "bd query" with ephemeral=true.
+// This is necessary because "bd list" only searches the issues table and does
+// not support an --ephemeral flag. Wisps (ephemeral issues like merge-request
+// beads) live in a separate table since beads v0.59.
+func (b *Beads) listEphemeral(opts ListOptions) ([]*Issue, error) {
+	// Build query expression: ephemeral=true AND <filters>
+	clauses := []string{"ephemeral=true"}
+
+	if opts.Label != "" {
+		clauses = append(clauses, "label="+opts.Label)
+	} else if opts.Type != "" {
+		clauses = append(clauses, "label=gt:"+opts.Type)
+	}
+	if opts.Status != "" && opts.Status != "all" {
+		clauses = append(clauses, "status="+opts.Status)
+	}
+	if opts.Priority >= 0 {
+		clauses = append(clauses, fmt.Sprintf("priority=%d", opts.Priority))
+	}
+	if opts.Parent != "" {
+		clauses = append(clauses, "parent="+opts.Parent)
+	}
+	if opts.Assignee != "" {
+		clauses = append(clauses, "assignee="+opts.Assignee)
+	}
+
+	queryExpr := strings.Join(clauses, " AND ")
+	args := []string{"query", "--json", queryExpr}
+
+	if opts.Status == "all" {
+		args = append(args, "--all")
+	}
+	if opts.Limit > 0 {
+		args = append(args, fmt.Sprintf("--limit=%d", opts.Limit))
+	}
+
+	out, err := b.run(args...)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(out) == 0 || !isJSONBytes(out) {
+		return nil, nil
+	}
+
+	var issues []*Issue
+	if err := json.Unmarshal(out, &issues); err != nil {
+		return nil, fmt.Errorf("parsing bd query output: %w", err)
 	}
 
 	return issues, nil
