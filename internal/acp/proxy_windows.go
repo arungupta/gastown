@@ -4,6 +4,8 @@ package acp
 
 import (
 	"os"
+
+	"golang.org/x/sys/windows"
 )
 
 // signalsToHandle returns the signals that Forward() should listen for.
@@ -19,14 +21,18 @@ func (p *Proxy) setupProcessGroup() {
 }
 
 // isProcessAlive checks if the agent process is still running.
-// On Windows, we use os.Signal(nil) to check process liveness.
+// On Windows, use OpenProcess with limited query access to probe liveness.
 func (p *Proxy) isProcessAlive() bool {
 	if p.cmd == nil || p.cmd.Process == nil {
 		return false
 	}
-	// On Windows, checking if a process is alive is often done by checking if wait fails
-	// or by trying to get a handle. os.Process.Signal(nil) is partially supported.
-	return p.cmd.Process.Signal(os.Signal(nil)) == nil
+
+	handle, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(p.cmd.Process.Pid))
+	if err != nil {
+		return err == windows.ERROR_ACCESS_DENIED
+	}
+	_ = windows.CloseHandle(handle)
+	return true
 }
 
 // terminateProcess kills the agent process.
