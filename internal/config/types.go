@@ -338,6 +338,10 @@ type DaemonThresholds struct {
 	// PressureMaxSessions is the maximum number of concurrent agent tmux
 	// sessions before new non-infrastructure spawns are deferred. Disabled by default (0 = unlimited).
 	PressureMaxSessions *int `json:"pressure_max_sessions,omitempty"`
+
+	// RateLimitCooldownDuration is how long to defer non-essential agent spawns
+	// after a rate-limit is detected on any session (default "5m").
+	RateLimitCooldownDuration string `json:"rate_limit_cooldown_duration,omitempty"`
 }
 
 // DeaconThresholds configures deacon health-check and dispatch thresholds.

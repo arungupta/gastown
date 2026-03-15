@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,6 +30,7 @@ import (
 	gitpkg "github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/mayor"
 	"github.com/steveyegge/gastown/internal/polecat"
+	"github.com/steveyegge/gastown/internal/quota"
 	"github.com/steveyegge/gastown/internal/refinery"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/session"
@@ -99,6 +101,37 @@ type Daemon struct {
 	// lastMaintenanceRun tracks when scheduled maintenance last ran.
 	// Only accessed from heartbeat loop goroutine - no sync needed.
 	lastMaintenanceRun time.Time
+
+	// rateLimitCooldownUntil is the global rate-limit cooldown deadline.
+	// When any session is detected as rate-limited, this is set to now + cooldown.
+	// While active, non-essential agent spawns (polecats, refineries, dogs) are deferred.
+	// Essential agents (mayor, deacon, witness) are never blocked.
+	// Only accessed from heartbeat loop goroutine - no sync needed.
+	rateLimitCooldownUntil time.Time
+
+	// lastRateLimitScan tracks the last time we proactively scanned sessions
+	// for rate-limit indicators. Throttled to once per minute.
+	// Only accessed from heartbeat loop goroutine - no sync needed.
+	lastRateLimitScan time.Time
+}
+
+// setRateLimitCooldown activates the global rate-limit cooldown.
+// While active, non-essential agent spawns are deferred to avoid burning
+// API credits against a throttled key.
+func (d *Daemon) setRateLimitCooldown(duration time.Duration) {
+	d.rateLimitCooldownUntil = time.Now().Add(duration)
+	d.logger.Printf("RATE_LIMIT_COOLDOWN: activated for %v (until %s)",
+		duration, d.rateLimitCooldownUntil.Format(time.RFC3339))
+}
+
+// isRateLimitCooldownActive returns true if the global rate-limit cooldown is active.
+func (d *Daemon) isRateLimitCooldownActive() bool {
+	return time.Now().Before(d.rateLimitCooldownUntil)
+}
+
+// rateLimitCooldownDuration returns the configured cooldown duration.
+func (d *Daemon) rateLimitCooldownDuration() time.Duration {
+	return d.loadOperationalConfig().GetDaemonConfig().RateLimitCooldownDurationD()
 }
 
 // sessionDeath records a detected session death for mass death analysis.
@@ -637,6 +670,10 @@ func (d *Daemon) heartbeat(state *State) {
 		d.checkDeaconHeartbeat()
 	}
 
+	// 3.5. Proactive rate-limit scan: detect rate-limited sessions before they crash.
+	// Throttled to once per minute to avoid excessive tmux subprocess calls.
+	d.scanForRateLimits()
+
 	// 4. Ensure Witnesses are running for all rigs (restart if dead)
 	// Check patrol config - can be disabled in mayor/daemon.json
 	if IsPatrolEnabled(d.patrolConfig, "witness") {
@@ -649,9 +686,12 @@ func (d *Daemon) heartbeat(state *State) {
 
 	// 5. Ensure Refineries are running for all rigs (restart if dead)
 	// Check patrol config - can be disabled in mayor/daemon.json
-	// Pressure-gated: refineries consume API credits, defer when system is loaded.
+	// Pressure-gated AND rate-limit-gated: refineries consume API credits.
 	if IsPatrolEnabled(d.patrolConfig, "refinery") {
-		if p := d.checkPressure("refinery"); !p.OK {
+		if d.isRateLimitCooldownActive() {
+			d.logger.Printf("Deferring refinery spawn: rate-limit cooldown active (until %s)",
+				d.rateLimitCooldownUntil.Format("15:04:05"))
+		} else if p := d.checkPressure("refinery"); !p.OK {
 			d.logger.Printf("Deferring refinery spawn: %s", p.Reason)
 		} else {
 			d.ensureRefineriesRunning()
@@ -666,9 +706,14 @@ func (d *Daemon) heartbeat(state *State) {
 	d.ensureMayorRunning()
 
 	// 6.5. Handle Dog lifecycle: cleanup stuck dogs and dispatch plugins
-	// Pressure-gated: dog dispatch spawns new agent sessions.
+	// Pressure-gated AND rate-limit-gated: dog dispatch spawns new agent sessions.
 	if IsPatrolEnabled(d.patrolConfig, "handler") {
-		if p := d.checkPressure("dog"); !p.OK {
+		if d.isRateLimitCooldownActive() {
+			d.logger.Printf("Deferring dog dispatch: rate-limit cooldown active (until %s)",
+				d.rateLimitCooldownUntil.Format("15:04:05"))
+			// Still run cleanup phases (stuck/stale/idle) — only skip dispatch
+			d.handleDogsCleanupOnly()
+		} else if p := d.checkPressure("dog"); !p.OK {
 			d.logger.Printf("Deferring dog dispatch: %s", p.Reason)
 			// Still run cleanup phases (stuck/stale/idle) — only skip dispatch
 			d.handleDogsCleanupOnly()
@@ -712,8 +757,11 @@ func (d *Daemon) heartbeat(state *State) {
 
 	// 14. Dispatch scheduled work (capacity-controlled polecat dispatch).
 	// Shells out to `gt scheduler run` to avoid circular import between daemon and cmd.
-	// Pressure-gated: polecats are the primary resource consumers.
-	if p := d.checkPressure("polecat"); !p.OK {
+	// Pressure-gated AND rate-limit-gated: polecats are the primary resource consumers.
+	if d.isRateLimitCooldownActive() {
+		d.logger.Printf("Deferring polecat dispatch: rate-limit cooldown active (until %s)",
+			d.rateLimitCooldownUntil.Format("15:04:05"))
+	} else if p := d.checkPressure("polecat"); !p.OK {
 		d.logger.Printf("Deferring polecat dispatch: %s", p.Reason)
 	} else {
 		d.dispatchQueuedWork()
@@ -1986,6 +2034,20 @@ func (d *Daemon) checkPolecatHealth(rigName, polecatName string) {
 	d.logger.Printf("CRASH DETECTED: polecat %s/%s has hook_bead=%s but session %s is dead",
 		rigName, polecatName, info.HookBead, sessionName)
 
+	// Scan the dead pane for rate-limit indicators.
+	// tmux sessions started with remain-on-exit keep their pane content after death.
+	// If the crash was caused by rate limiting, activate global cooldown and use
+	// rate-limit-specific backoff to prevent burning through restart attempts.
+	if d.scanDeadPaneForRateLimit(sessionName) {
+		agentID := rigName + "/polecats/" + polecatName
+		d.logger.Printf("RATE_LIMIT_CRASH: polecat %s/%s died due to rate limiting, activating cooldown", rigName, polecatName)
+		d.setRateLimitCooldown(d.rateLimitCooldownDuration())
+		if d.restartTracker != nil {
+			d.restartTracker.RecordRateLimitRestart(agentID)
+			_ = d.restartTracker.Save()
+		}
+	}
+
 	// Track this death for mass death detection
 	d.recordSessionDeath(sessionName)
 
@@ -1998,9 +2060,9 @@ func (d *Daemon) checkPolecatHealth(rigName, polecatName string) {
 }
 
 // recordSessionDeath records a session death and checks for mass death pattern.
+// Returns true if mass death was detected, so caller can handle it outside the lock.
 func (d *Daemon) recordSessionDeath(sessionName string) {
 	d.deathsMu.Lock()
-	defer d.deathsMu.Unlock()
 
 	now := time.Now()
 
@@ -2020,31 +2082,48 @@ func (d *Daemon) recordSessionDeath(sessionName string) {
 	}
 	d.recentDeaths = recent
 
-	// Check for mass death
-	if len(d.recentDeaths) >= massDeathThreshold {
+	// Check for mass death — emit outside lock to avoid holding mutex
+	// during slow tmux subprocess calls in scanLiveSessionsForRateLimit.
+	massDeath := len(d.recentDeaths) >= massDeathThreshold
+	d.deathsMu.Unlock()
+
+	if massDeath {
 		d.emitMassDeathEvent()
 	}
 }
 
 // emitMassDeathEvent logs a mass death event when multiple sessions die in a short window.
+// After detecting mass death, scans surviving sessions for rate-limit indicators.
+// If any are rate-limited, activates global cooldown — the common scenario is the
+// API going overloaded and multiple sessions dying simultaneously.
 func (d *Daemon) emitMassDeathEvent() {
-	// Collect session names
+	// Collect session names under lock, then release before slow operations.
+	d.deathsMu.Lock()
 	var sessions []string
 	for _, death := range d.recentDeaths {
 		sessions = append(sessions, death.sessionName)
 	}
+	// Clear the deaths to avoid repeated alerts
+	d.recentDeaths = nil
+	d.deathsMu.Unlock()
 
 	count := len(sessions)
 	window := massDeathWindow.String()
 
 	d.logger.Printf("MASS DEATH DETECTED: %d sessions died in %s: %v", count, window, sessions)
 
+	// Scan surviving sessions for rate-limit correlation (outside lock).
+	// If any live session shows rate-limit indicators, the mass death is likely
+	// caused by API overload — activate cooldown to prevent crash-loop.
+	// Skip if cooldown is already active to avoid redundant tmux scans.
+	if !d.isRateLimitCooldownActive() && d.scanLiveSessionsForRateLimit() {
+		d.logger.Printf("MASS_DEATH_RATE_LIMIT: mass death correlated with API rate limits, activating cooldown")
+		d.setRateLimitCooldown(d.rateLimitCooldownDuration())
+	}
+
 	// Emit feed event
 	_ = events.LogFeed(events.TypeMassDeath, "daemon",
 		events.MassDeathPayload(count, window, sessions, ""))
-
-	// Clear the deaths to avoid repeated alerts
-	d.recentDeaths = nil
 }
 
 // isBeadClosed checks if a bead's status is "closed" by querying bd show --json.
@@ -2289,5 +2368,107 @@ func (d *Daemon) dispatchQueuedWork() {
 		d.logger.Printf("Scheduler dispatch failed: %v (output: %s)", err, string(out))
 	} else if len(out) > 0 {
 		d.logger.Printf("Scheduler dispatch: %s", string(out))
+	}
+}
+
+// rateLimitPatterns are compiled regex patterns for detecting rate-limited sessions.
+// Compiled once at package init from constants.DefaultRateLimitPatterns.
+var rateLimitPatterns []*regexp.Regexp
+
+func init() {
+	for _, p := range constants.DefaultRateLimitPatterns {
+		re, err := regexp.Compile("(?i)" + p)
+		if err != nil {
+			continue // Skip invalid patterns (shouldn't happen with well-tested defaults)
+		}
+		rateLimitPatterns = append(rateLimitPatterns, re)
+	}
+}
+
+// matchesRateLimitPattern checks if a line matches any rate-limit pattern.
+func matchesRateLimitPattern(line string) bool {
+	for _, re := range rateLimitPatterns {
+		if re.MatchString(line) {
+			return true
+		}
+	}
+	return false
+}
+
+// Rate-limit pane scanning parameters — mirrors quota.scanLines and quota.checkLines.
+// We capture scanLinesForRateLimit lines but only check the bottom checkLinesForRateLimit
+// for rate-limit patterns (see quota/scan.go for the rationale).
+const (
+	scanLinesForRateLimit  = 30
+	checkLinesForRateLimit = 20
+)
+
+// scanDeadPaneForRateLimit checks a dead tmux session's pane for rate-limit patterns.
+// tmux sessions started with remain-on-exit preserve pane content after death,
+// allowing post-mortem analysis. Returns true if rate-limit patterns are found.
+func (d *Daemon) scanDeadPaneForRateLimit(sessionName string) bool {
+	content, err := d.tmux.CapturePane(sessionName, scanLinesForRateLimit)
+	if err != nil {
+		// Pane not available (session fully destroyed). Fall back to regular crash handling.
+		return false
+	}
+
+	lines := strings.Split(content, "\n")
+	start := len(lines) - checkLinesForRateLimit
+	if start < 0 {
+		start = 0
+	}
+
+	for _, line := range lines[start:] {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if matchesRateLimitPattern(line) {
+			d.logger.Printf("Rate-limit pattern matched in dead pane %s: %q", sessionName, line)
+			return true
+		}
+	}
+	return false
+}
+
+// scanLiveSessionsForRateLimit checks all surviving tmux sessions for rate-limit indicators
+// using the quota.Scanner. Returns true if any session is rate-limited.
+func (d *Daemon) scanLiveSessionsForRateLimit() bool {
+	scanner, err := quota.NewScanner(d.tmux, nil, nil)
+	if err != nil {
+		d.logger.Printf("Warning: failed to create rate-limit scanner: %v", err)
+		return false
+	}
+
+	results, err := scanner.ScanAll()
+	if err != nil {
+		d.logger.Printf("Warning: rate-limit scan failed: %v", err)
+		return false
+	}
+
+	for _, r := range results {
+		if r.RateLimited {
+			d.logger.Printf("Rate-limited session detected: %s (matched: %q)", r.Session, r.MatchedLine)
+			return true
+		}
+	}
+	return false
+}
+
+// scanForRateLimits proactively scans all live sessions for rate-limit indicators.
+// Throttled to once per minute to avoid excessive tmux subprocess calls.
+// If any session is rate-limited, activates the global cooldown before sessions die.
+func (d *Daemon) scanForRateLimits() {
+	if time.Since(d.lastRateLimitScan) < time.Minute {
+		return // Throttled
+	}
+	d.lastRateLimitScan = time.Now()
+
+	if d.scanLiveSessionsForRateLimit() {
+		if !d.isRateLimitCooldownActive() {
+			d.logger.Printf("PROACTIVE_RATE_LIMIT: detected rate-limited session, activating cooldown")
+			d.setRateLimitCooldown(d.rateLimitCooldownDuration())
+		}
 	}
 }

@@ -52,9 +52,10 @@ const (
 	// Pressure check defaults — fully opt-in. All zero = disabled.
 	// Configure in settings/config.json under operational.daemon to enable.
 	// Example: {"pressure_cpu_threshold": 3.0, "pressure_mem_threshold_gb": 0.5}
-	DefaultPressureCPUThreshold   = 0.0
-	DefaultPressureMemThresholdGB = 0.0
-	DefaultPressureMaxSessions    = 0
+	DefaultPressureCPUThreshold          = 0.0
+	DefaultPressureMemThresholdGB        = 0.0
+	DefaultPressureMaxSessions           = 0
+	DefaultRateLimitCooldownDuration     = 5 * time.Minute
 )
 
 // Deacon defaults.
@@ -414,6 +415,14 @@ func (d *DaemonThresholds) PressureMaxSessionsV() int {
 		return *d.PressureMaxSessions
 	}
 	return DefaultPressureMaxSessions
+}
+
+// RateLimitCooldownDurationD returns the configured or default rate-limit cooldown duration.
+func (d *DaemonThresholds) RateLimitCooldownDurationD() time.Duration {
+	if d != nil {
+		return ParseDurationOrDefault(d.RateLimitCooldownDuration, DefaultRateLimitCooldownDuration)
+	}
+	return DefaultRateLimitCooldownDuration
 }
 
 // --- Deacon accessors ---

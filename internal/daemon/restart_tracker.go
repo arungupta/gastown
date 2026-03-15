@@ -44,6 +44,19 @@ func DefaultRestartTrackerConfig() RestartTrackerConfig {
 	}
 }
 
+// DefaultRateLimitBackoffConfig returns a RestartTrackerConfig with longer
+// backoffs suitable for rate-limit scenarios.
+func DefaultRateLimitBackoffConfig() RestartTrackerConfig {
+	return RestartTrackerConfig{
+		InitialBackoff:    2 * time.Minute,
+		MaxBackoff:        20 * time.Minute,
+		BackoffMultiplier: 2.0,
+		CrashLoopWindow:   15 * time.Minute,
+		CrashLoopCount:    3,
+		StabilityPeriod:   30 * time.Minute,
+	}
+}
+
 // withDefaults returns a config with zero fields filled from defaults.
 func (c RestartTrackerConfig) withDefaults() RestartTrackerConfig {
 	d := DefaultRestartTrackerConfig()
@@ -71,10 +84,11 @@ func (c RestartTrackerConfig) withDefaults() RestartTrackerConfig {
 // RestartTracker tracks agent restart attempts with exponential backoff.
 // This prevents runaway restart loops when an agent keeps crashing.
 type RestartTracker struct {
-	mu       sync.RWMutex
-	townRoot string
-	config   RestartTrackerConfig
-	state    *RestartState
+	mu               sync.RWMutex
+	townRoot         string
+	config           RestartTrackerConfig
+	rateLimitBackoff RestartTrackerConfig
+	state            *RestartState
 }
 
 // RestartState persists restart tracking data.
@@ -84,20 +98,27 @@ type RestartState struct {
 
 // AgentRestartInfo tracks restart info for a single agent.
 type AgentRestartInfo struct {
-	LastRestart    time.Time `json:"last_restart"`
-	RestartCount   int       `json:"restart_count"`
-	BackoffUntil   time.Time `json:"backoff_until"`
-	CrashLoopSince time.Time `json:"crash_loop_since,omitempty"`
+	LastRestart       time.Time `json:"last_restart"`
+	RestartCount      int       `json:"restart_count"`
+	BackoffUntil      time.Time `json:"backoff_until"`
+	CrashLoopSince    time.Time `json:"crash_loop_since,omitempty"`
+	LastFailureReason string    `json:"last_failure_reason,omitempty"` // e.g. "rate_limit", "crash"
 }
 
 // NewRestartTracker creates a new restart tracker with the given config.
 // Zero-valued config fields are filled with defaults.
 func NewRestartTracker(townRoot string, cfg RestartTrackerConfig) *RestartTracker {
 	return &RestartTracker{
-		townRoot: townRoot,
-		config:   cfg.withDefaults(),
-		state:    &RestartState{Agents: make(map[string]*AgentRestartInfo)},
+		townRoot:         townRoot,
+		config:           cfg.withDefaults(),
+		rateLimitBackoff: DefaultRateLimitBackoffConfig(),
+		state:            &RestartState{Agents: make(map[string]*AgentRestartInfo)},
 	}
+}
+
+// RateLimitBackoffConfig returns the rate-limit backoff configuration (read-only).
+func (rt *RestartTracker) RateLimitBackoffConfig() RestartTrackerConfig {
+	return rt.rateLimitBackoff
 }
 
 // restartStateFile returns the path to the restart state file.
@@ -158,6 +179,22 @@ func (rt *RestartTracker) RecordRestart(agentID string) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 
+	rt.recordRestartLocked(agentID, rt.config, "crash")
+}
+
+// RecordRateLimitRestart records a restart attempt caused by a rate limit
+// and calculates the next backoff using the rate-limit backoff config, which
+// uses longer initial backoffs and a stricter crash-loop threshold.
+func (rt *RestartTracker) RecordRateLimitRestart(agentID string) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+
+	rt.recordRestartLocked(agentID, rt.rateLimitBackoff, "rate_limit")
+}
+
+// recordRestartLocked is the shared implementation for recording restarts.
+// Must be called with rt.mu held.
+func (rt *RestartTracker) recordRestartLocked(agentID string, cfg RestartTrackerConfig, reason string) {
 	now := time.Now()
 	info, exists := rt.state.Agents[agentID]
 	if !exists {
@@ -166,7 +203,7 @@ func (rt *RestartTracker) RecordRestart(agentID string) {
 	}
 
 	// Check if previous restart was stable (long ago)
-	if !info.LastRestart.IsZero() && now.Sub(info.LastRestart) > rt.config.StabilityPeriod {
+	if !info.LastRestart.IsZero() && now.Sub(info.LastRestart) > cfg.StabilityPeriod {
 		// Reset backoff - agent was stable
 		info.RestartCount = 0
 		info.CrashLoopSince = time.Time{}
@@ -174,20 +211,21 @@ func (rt *RestartTracker) RecordRestart(agentID string) {
 
 	info.LastRestart = now
 	info.RestartCount++
+	info.LastFailureReason = reason
 
 	// Calculate backoff with exponential increase
-	backoffDuration := rt.config.InitialBackoff
-	for i := 1; i < info.RestartCount && backoffDuration < rt.config.MaxBackoff; i++ {
-		backoffDuration = time.Duration(float64(backoffDuration) * rt.config.BackoffMultiplier)
+	backoffDuration := cfg.InitialBackoff
+	for i := 1; i < info.RestartCount && backoffDuration < cfg.MaxBackoff; i++ {
+		backoffDuration = time.Duration(float64(backoffDuration) * cfg.BackoffMultiplier)
 	}
-	if backoffDuration > rt.config.MaxBackoff {
-		backoffDuration = rt.config.MaxBackoff
+	if backoffDuration > cfg.MaxBackoff {
+		backoffDuration = cfg.MaxBackoff
 	}
 	info.BackoffUntil = now.Add(backoffDuration)
 
 	// Check for crash loop
-	if info.RestartCount >= rt.config.CrashLoopCount {
-		windowStart := now.Add(-rt.config.CrashLoopWindow)
+	if info.RestartCount >= cfg.CrashLoopCount {
+		windowStart := now.Add(-cfg.CrashLoopWindow)
 		if info.LastRestart.After(windowStart) {
 			info.CrashLoopSince = now
 		}
