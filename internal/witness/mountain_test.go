@@ -336,6 +336,12 @@ func TestTrackConvoyFailures_Integration(t *testing.T) {
 				Classification: ZombieAgentDeadInSession,
 				HookBead:       "",
 			},
+			{
+				// gt-eom: Dead session + closed bead — should NOT be tracked
+				PolecatName:    "delta",
+				Classification: ZombieBeadClosedSessionDead,
+				HookBead:       "gt-task-d",
+			},
 		},
 	}
 
@@ -345,7 +351,7 @@ func TestTrackConvoyFailures_Integration(t *testing.T) {
 
 	trackConvoyFailures(mock.toBdCli(), "/tmp", result)
 
-	// Should have queried only gt-task-a (not gt-task-b or empty)
+	// Should have queried only gt-task-a (not gt-task-b, empty, or gt-task-d)
 	if len(mock.execCalls) != 1 {
 		t.Errorf("expected 1 exec call, got %d: %v", len(mock.execCalls), mock.execCalls)
 	}

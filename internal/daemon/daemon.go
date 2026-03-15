@@ -1984,14 +1984,15 @@ func (d *Daemon) checkPolecatHealth(rigName, polecatName string) {
 		return
 	}
 
-	// Stale hook guard: skip polecats whose hook_bead is already closed.
-	// When a polecat completes work normally (gt done), the hook_bead gets closed
-	// but may not be cleared from the agent bead before the session stops.
-	// Without this check, every heartbeat cycle fires a false CRASHED_POLECAT alert
-	// for the dead session + non-empty hook_bead combination.
+	// gt-eom: Auto-nuke polecats whose hook_bead is already closed.
+	// When a bead is closed (by any agent) and the polecat's session is dead,
+	// the polecat is stale state that needs cleanup. Previously this just skipped
+	// crash detection, leaving the polecat sitting forever with repeated log noise.
+	// Now we nuke the polecat to clean up the stale state.
 	if d.isBeadClosed(info.HookBead) {
-		d.logger.Printf("Skipping crash detection for %s/%s: hook_bead %s is already closed (work completed normally)",
+		d.logger.Printf("AUTO-NUKE: polecat %s/%s has dead session + closed hook_bead %s, nuking stale polecat (gt-eom)",
 			rigName, polecatName, info.HookBead)
+		d.nukeStalePolecatWithClosedHook(rigName, polecatName, info.HookBead)
 		return
 	}
 
@@ -2168,6 +2169,28 @@ Restart deferred to stuck-agent-dog plugin for context-aware recovery.`,
 	if err := cmd.Run(); err != nil {
 		d.logger.Printf("Warning: failed to notify witness of crashed polecat: %v", err)
 	}
+}
+
+// nukeStalePolecatWithClosedHook nukes a polecat whose session is dead and
+// hook_bead is already closed. This cleans up stale state that would otherwise
+// cause repeated daemon log noise. Uses `gt polecat nuke` which includes safety
+// gates for pending MRs and Mayor ACP sessions. (gt-eom)
+func (d *Daemon) nukeStalePolecatWithClosedHook(rigName, polecatName, hookBead string) {
+	address := fmt.Sprintf("%s/%s", rigName, polecatName)
+	cmd := exec.Command(d.gtPath, "polecat", "nuke", address) //nolint:gosec // G204: args are constructed internally
+	cmd.Dir = d.config.TownRoot
+	cmd.Env = os.Environ()
+	if err := cmd.Run(); err != nil {
+		d.logger.Printf("Warning: failed to nuke stale polecat %s (hook_bead %s): %v (gt-eom)", address, hookBead, err)
+		return
+	}
+	d.logger.Printf("Nuked stale polecat %s: hook_bead %s was closed, session was dead (gt-eom)", address, hookBead)
+
+	// Emit feed event for audit trail
+	sessionName := session.PolecatSessionName(session.PrefixFor(rigName), polecatName)
+	_ = events.LogFeed(events.TypeSessionDeath, sessionName,
+		events.SessionDeathPayload(sessionName, rigName+"/polecats/"+polecatName,
+			fmt.Sprintf("auto-nuked: dead session + closed hook_bead %s (gt-eom)", hookBead), "daemon"))
 }
 
 // reapIdlePolecats kills polecat tmux sessions that have been idle too long.

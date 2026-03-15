@@ -952,6 +952,10 @@ const (
 	ZombieSessionDeadActive ZombieClassification = "session-dead-active"
 	// ZombieAgentSelfReportedStuck: agent self-reported stuck via heartbeat v2 (gt-3vr5).
 	ZombieAgentSelfReportedStuck ZombieClassification = "agent-self-reported-stuck"
+	// ZombieBeadClosedSessionDead: session dead and hook bead already closed by another agent.
+	// Unlike ZombieBeadClosedStillRunning (live session), nothing is running — just stale state
+	// that needs cleanup. Auto-nuked to prevent daemon CRASH DETECTED spam. (gt-eom)
+	ZombieBeadClosedSessionDead ZombieClassification = "bead-closed-session-dead"
 )
 
 // ImpliesActiveWork returns true if this classification indicates the polecat
@@ -1269,13 +1273,26 @@ func detectZombieDeadSession(bd *BdCli, workDir, townRoot, rigName, polecatName,
 			return ZombieResult{}, false // Recent — still working through gt done
 		}
 
-		// If bead is already closed, the polecat completed successfully.
-		// The dead session is expected (gt done kills it). Leave it alone. (gt-sy8)
+		// gt-eom: If bead is already closed and session is dead, nuke the polecat.
+		// Previously this returned false (gt-sy8/gt-dsgp), leaving stale polecats
+		// that the daemon would log about every heartbeat cycle. Now we auto-nuke
+		// to clean up the stale state. Safety gates in NukePolecat prevent nuking
+		// polecats with pending MRs or during Mayor ACP sessions.
 		beadAlreadyClosed := snapHook != "" && getBeadStatus(bd, workDir, snapHook) == "closed"
 		if beadAlreadyClosed {
-			// gt-dsgp: Polecat completed its work. Don't nuke, don't restart.
-			// The sandbox is preserved for reuse by future slings.
-			return ZombieResult{}, false
+			zombie := ZombieResult{
+				PolecatName:    polecatName,
+				AgentState:     snapState,
+				Classification: ZombieBeadClosedSessionDead,
+				HookBead:       snapHook,
+				WasActive:      false, // Work completed, not active
+				Action:         "nuked-bead-closed-session-dead",
+			}
+			if err := NukePolecat(bd, workDir, rigName, polecatName); err != nil {
+				zombie.Error = err
+				zombie.Action = fmt.Sprintf("nuke-failed-bead-closed: %v", err)
+			}
+			return zombie, true
 		}
 
 		// Persistent polecat model (gt-6a9d): Do NOT touch if there's a pending MR.
@@ -1322,12 +1339,24 @@ func detectZombieDeadSession(bd *BdCli, workDir, townRoot, rigName, polecatName,
 		// Spawning for too long — fall through to zombie handling
 	}
 
-	// A polecat whose hook bead is already CLOSED completed its work
-	// successfully. The dead session is expected (gt done kills it).
-	// Don't flag as zombie or trigger re-dispatch. (gt-sy8)
-	// gt-dsgp: Don't nuke — sandbox preserved for reuse.
+	// gt-eom: If hook bead is closed and session is dead, nuke the stale polecat.
+	// Previously returned false (gt-sy8/gt-dsgp), leaving stale state that caused
+	// repeated daemon CRASH DETECTED logs. NukePolecat has safety gates for
+	// pending MRs and Mayor ACP sessions.
 	if snapHook != "" && getBeadStatus(bd, workDir, snapHook) == "closed" {
-		return ZombieResult{}, false
+		zombie := ZombieResult{
+			PolecatName:    polecatName,
+			AgentState:     snapState,
+			Classification: ZombieBeadClosedSessionDead,
+			HookBead:       snapHook,
+			WasActive:      false, // Work completed, not active
+			Action:         "nuked-bead-closed-session-dead",
+		}
+		if err := NukePolecat(bd, workDir, rigName, polecatName); err != nil {
+			zombie.Error = err
+			zombie.Action = fmt.Sprintf("nuke-failed-bead-closed: %v", err)
+		}
+		return zombie, true
 	}
 
 	// TOCTOU guard: verify session wasn't recreated since detection.

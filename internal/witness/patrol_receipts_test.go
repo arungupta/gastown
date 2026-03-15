@@ -71,6 +71,7 @@ func TestReceiptVerdictForZombie_AllStates(t *testing.T) {
 		{name: "done-intent-dead", classification: ZombieDoneIntentDead, wasActive: true, want: PatrolVerdictStale},
 		{name: "session-dead-active", classification: ZombieSessionDeadActive, wasActive: true, want: PatrolVerdictStale},
 		{name: "idle-dirty-sandbox", classification: ZombieIdleDirtySandbox, want: PatrolVerdictOrphan},
+		{name: "bead-closed-session-dead", classification: ZombieBeadClosedSessionDead, want: PatrolVerdictOrphan}, // gt-eom: work completed, cleanup only
 
 		// Real agent states with classification
 		{name: "active working", state: "working", classification: ZombieSessionDeadActive, wasActive: true, want: PatrolVerdictStale},

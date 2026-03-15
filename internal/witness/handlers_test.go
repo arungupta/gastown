@@ -809,6 +809,56 @@ func TestDetectZombie_BeadClosedVsDoneIntent(t *testing.T) {
 	}
 }
 
+// TestDetectZombie_BeadClosedSessionDead verifies that a dead session + closed
+// hook_bead results in a ZombieBeadClosedSessionDead classification and nuke action.
+// This is the gt-eom fix: previously this combination was silently skipped, leaving
+// stale polecats that the daemon would log about every heartbeat cycle.
+func TestDetectZombie_BeadClosedSessionDead(t *testing.T) {
+	t.Parallel()
+	// Dead session + hook bead closed → should classify as zombie
+	sessionAlive := false
+	hookBead := "gt-some-issue"
+	beadStatus := "closed"
+
+	// Dead session + closed bead → should detect and nuke
+	shouldDetect := !sessionAlive && hookBead != "" && beadStatus == "closed"
+	if !shouldDetect {
+		t.Error("expected zombie detection for dead session with closed bead")
+	}
+
+	// Dead session + bead open → should NOT classify as bead-closed-session-dead
+	beadStatus = "open"
+	shouldBeRegularZombie := !sessionAlive && hookBead != "" && beadStatus != "closed"
+	if !shouldBeRegularZombie {
+		t.Error("open bead with dead session should be regular zombie, not bead-closed-session-dead")
+	}
+}
+
+// TestZombieBeadClosedSessionDead_DoesNotImplyActiveWork verifies that the
+// new ZombieBeadClosedSessionDead classification does NOT imply active work.
+// The work was completed (bead closed), so this is cleanup, not crash recovery.
+func TestZombieBeadClosedSessionDead_DoesNotImplyActiveWork(t *testing.T) {
+	t.Parallel()
+	if ZombieBeadClosedSessionDead.ImpliesActiveWork() {
+		t.Error("ZombieBeadClosedSessionDead should not imply active work (bead is closed)")
+	}
+	// Contrast: ZombieBeadClosedStillRunning DOES imply active work (session is alive)
+	if !ZombieBeadClosedStillRunning.ImpliesActiveWork() {
+		t.Error("ZombieBeadClosedStillRunning should imply active work for comparison")
+	}
+}
+
+// TestZombieBeadClosedSessionDead_Classification verifies the string value
+// of the new classification constant.
+func TestZombieBeadClosedSessionDead_Classification(t *testing.T) {
+	t.Parallel()
+	got := string(ZombieBeadClosedSessionDead)
+	want := "bead-closed-session-dead"
+	if got != want {
+		t.Errorf("ZombieBeadClosedSessionDead = %q, want %q", got, want)
+	}
+}
+
 func TestResetAbandonedBead_EmptyHookBead(t *testing.T) {
 	t.Parallel()
 	// resetAbandonedBead should return false for empty hookBead

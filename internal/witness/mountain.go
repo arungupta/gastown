@@ -41,9 +41,10 @@ func trackConvoyFailures(bd *BdCli, workDir string, result *DetectZombiePolecats
 		zombie := &result.Zombies[i]
 
 		// Only track failures for zombies that had active work on an issue
-		// and didn't complete it. ZombieBeadClosedStillRunning means the work
-		// WAS completed — don't count that as a failure.
-		if zombie.HookBead == "" || zombie.Classification == ZombieBeadClosedStillRunning {
+		// and didn't complete it. ZombieBeadClosedStillRunning and
+		// ZombieBeadClosedSessionDead mean the work WAS completed — don't
+		// count as a failure.
+		if zombie.HookBead == "" || zombie.Classification == ZombieBeadClosedStillRunning || zombie.Classification == ZombieBeadClosedSessionDead {
 			continue
 		}
 

@@ -185,12 +185,13 @@ func TestCheckPolecatHealth_DBStateOverridesDescription(t *testing.T) {
 	}
 }
 
-// TestCheckPolecatHealth_SkipsClosedHookBead verifies that checkPolecatHealth
-// does NOT fire CRASHED_POLECAT when the hook_bead is already closed.
-// This is the regression test for the false-positive spam bug (issue hq-1o7):
-// when a polecat completes work normally, the hook_bead gets closed but the
-// stale reference remains on the agent bead, causing repeated false alerts.
-func TestCheckPolecatHealth_SkipsClosedHookBead(t *testing.T) {
+// TestCheckPolecatHealth_NukesClosedHookBead verifies that checkPolecatHealth
+// auto-nukes a polecat when the hook_bead is already closed and the session is dead.
+// This is the regression test for gt-eom: previously this just skipped crash detection,
+// leaving the polecat as stale state that the daemon would log about every heartbeat.
+// Now it nukes the polecat to clean up. Also verifies CRASH DETECTED is NOT fired
+// (the work completed normally, this is cleanup not crash recovery).
+func TestCheckPolecatHealth_NukesClosedHookBead(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("test uses Unix shell script mocks for tmux and bd")
 	}
@@ -214,6 +215,14 @@ func TestCheckPolecatHealth_SkipsClosedHookBead(t *testing.T) {
 		t.Fatalf("writing fake bd: %v", err)
 	}
 
+	// Create a fake gt script that logs invocations to verify nuke was called
+	gtLog := filepath.Join(t.TempDir(), "gt-invocations.log")
+	fakeGt := filepath.Join(binDir, "gt")
+	gtScript := fmt.Sprintf("#!/bin/sh\necho \"$@\" >> %s\n", gtLog)
+	if err := os.WriteFile(fakeGt, []byte(gtScript), 0755); err != nil {
+		t.Fatalf("writing fake gt: %v", err)
+	}
+
 	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
 
 	var logBuf strings.Builder
@@ -222,16 +231,142 @@ func TestCheckPolecatHealth_SkipsClosedHookBead(t *testing.T) {
 		logger: log.New(&logBuf, "", 0),
 		tmux:   tmux.NewTmux(),
 		bdPath: bdPath,
+		gtPath: fakeGt,
 	}
 
 	d.checkPolecatHealth("myr", "mycat")
 
 	got := logBuf.String()
-	if !strings.Contains(got, "hook_bead fe-xyz is already closed") {
-		t.Errorf("expected log about closed hook_bead, got: %q", got)
+	if !strings.Contains(got, "AUTO-NUKE") {
+		t.Errorf("expected AUTO-NUKE log for closed hook_bead + dead session, got: %q", got)
 	}
 	if strings.Contains(got, "CRASH DETECTED") {
 		t.Errorf("closed hook_bead must not trigger CRASH DETECTED, got: %q", got)
+	}
+
+	// Verify gt polecat nuke was called
+	logData, err := os.ReadFile(gtLog)
+	if err != nil {
+		t.Fatalf("reading gt invocation log: %v", err)
+	}
+	invocations := string(logData)
+	if !strings.Contains(invocations, "polecat nuke") {
+		t.Errorf("expected gt polecat nuke invocation, got: %q", invocations)
+	}
+	if !strings.Contains(invocations, "myr/mycat") {
+		t.Errorf("expected nuke target myr/mycat, got: %q", invocations)
+	}
+}
+
+// TestCheckPolecatHealth_ClosedHookNukeFailureIsNonFatal verifies that when
+// the nuke command fails for a closed hook_bead, it logs a warning but does
+// not panic or fire CRASH DETECTED.
+func TestCheckPolecatHealth_ClosedHookNukeFailureIsNonFatal(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mocks for tmux and bd")
+	}
+	binDir := t.TempDir()
+	writeFakeTestTmux(t, binDir)
+	recentTime := time.Now().UTC().Format(time.RFC3339)
+
+	agentJSON := fmt.Sprintf(`[{"id":"gt-myr-polecat-mycat","issue_type":"agent","labels":["gt:agent"],"description":"agent_state: working","hook_bead":"fe-xyz","agent_state":"working","updated_at":"%s"}]`, recentTime)
+	hookJSON := `[{"id":"fe-xyz","status":"closed"}]`
+	script := fmt.Sprintf("#!/bin/sh\n"+
+		"case \"$2\" in\n"+
+		"  gt-myr-polecat-mycat) echo '%s';;\n"+
+		"  fe-xyz) echo '%s';;\n"+
+		"  *) echo '[]'; exit 1;;\n"+
+		"esac\n", agentJSON, hookJSON)
+	bdPath := filepath.Join(binDir, "bd")
+	if err := os.WriteFile(bdPath, []byte(script), 0755); err != nil {
+		t.Fatalf("writing fake bd: %v", err)
+	}
+
+	// Create a gt script that fails on nuke
+	fakeGt := filepath.Join(binDir, "gt")
+	gtScript := "#!/bin/sh\nexit 1\n"
+	if err := os.WriteFile(fakeGt, []byte(gtScript), 0755); err != nil {
+		t.Fatalf("writing fake gt: %v", err)
+	}
+
+	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
+
+	var logBuf strings.Builder
+	d := &Daemon{
+		config: &Config{TownRoot: t.TempDir()},
+		logger: log.New(&logBuf, "", 0),
+		tmux:   tmux.NewTmux(),
+		bdPath: bdPath,
+		gtPath: fakeGt,
+	}
+
+	// Should not panic
+	d.checkPolecatHealth("myr", "mycat")
+
+	got := logBuf.String()
+	if !strings.Contains(got, "AUTO-NUKE") {
+		t.Errorf("expected AUTO-NUKE log, got: %q", got)
+	}
+	if !strings.Contains(got, "Warning: failed to nuke") {
+		t.Errorf("expected warning about nuke failure, got: %q", got)
+	}
+	if strings.Contains(got, "CRASH DETECTED") {
+		t.Errorf("nuke failure must not fall through to CRASH DETECTED, got: %q", got)
+	}
+}
+
+// TestCheckPolecatHealth_OpenHookBeadStillDetectsCrash verifies that when a
+// hook_bead is NOT closed (still open/in_progress), the crash detection path
+// still fires as before. This ensures gt-eom's auto-nuke doesn't accidentally
+// suppress legitimate crash detection.
+func TestCheckPolecatHealth_OpenHookBeadStillDetectsCrash(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mocks for tmux and bd")
+	}
+	binDir := t.TempDir()
+	writeFakeTestTmux(t, binDir)
+	recentTime := time.Now().UTC().Format(time.RFC3339)
+
+	// Hook bead is open (not closed) — should still fire CRASH DETECTED
+	agentJSON := fmt.Sprintf(`[{"id":"gt-myr-polecat-mycat","issue_type":"agent","labels":["gt:agent"],"description":"agent_state: working","hook_bead":"fe-xyz","agent_state":"working","updated_at":"%s"}]`, recentTime)
+	hookJSON := `[{"id":"fe-xyz","status":"in_progress"}]`
+	script := fmt.Sprintf("#!/bin/sh\n"+
+		"case \"$2\" in\n"+
+		"  gt-myr-polecat-mycat) echo '%s';;\n"+
+		"  fe-xyz) echo '%s';;\n"+
+		"  *) echo '[]'; exit 1;;\n"+
+		"esac\n", agentJSON, hookJSON)
+	bdPath := filepath.Join(binDir, "bd")
+	if err := os.WriteFile(bdPath, []byte(script), 0755); err != nil {
+		t.Fatalf("writing fake bd: %v", err)
+	}
+
+	// Create a fake gt that succeeds (for witness notification)
+	fakeGt := filepath.Join(binDir, "gt")
+	gtScript := "#!/bin/sh\nexit 0\n"
+	if err := os.WriteFile(fakeGt, []byte(gtScript), 0755); err != nil {
+		t.Fatalf("writing fake gt: %v", err)
+	}
+
+	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
+
+	var logBuf strings.Builder
+	d := &Daemon{
+		config: &Config{TownRoot: t.TempDir()},
+		logger: log.New(&logBuf, "", 0),
+		tmux:   tmux.NewTmux(),
+		bdPath: bdPath,
+		gtPath: fakeGt,
+	}
+
+	d.checkPolecatHealth("myr", "mycat")
+
+	got := logBuf.String()
+	if strings.Contains(got, "AUTO-NUKE") {
+		t.Errorf("open hook_bead must NOT trigger auto-nuke, got: %q", got)
+	}
+	if !strings.Contains(got, "CRASH DETECTED") {
+		t.Errorf("open hook_bead with dead session should fire CRASH DETECTED, got: %q", got)
 	}
 }
 
