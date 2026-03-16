@@ -448,34 +448,65 @@ func runBdPrime(workDir string) {
 	}
 }
 
+// memoryTypeLabels maps type keys to human-readable section headers for prime injection.
+var memoryTypeLabels = map[string]string{
+	"feedback":  "Behavioral Rules (from user feedback)",
+	"user":      "User Context",
+	"project":   "Project Context",
+	"reference":  "Reference Links",
+	"general":   "General",
+}
+
 // runMemoryInject loads memories from beads kv and outputs them during prime.
-// This replaces MEMORY.md injection with bead-backed agent memory.
+// Memories are grouped by type and ordered by priority (feedback first).
 func runMemoryInject() {
 	kvs, err := bdKvListJSON()
 	if err != nil {
 		return // Silently skip if kv list fails
 	}
 
-	var memories []string
+	// Group memories by type
+	type mem struct {
+		shortKey string
+		value    string
+	}
+	grouped := make(map[string][]mem)
+
 	for k, v := range kvs {
 		if !strings.HasPrefix(k, memoryKeyPrefix) {
 			continue
 		}
-		shortKey := strings.TrimPrefix(k, memoryKeyPrefix)
-		memories = append(memories, fmt.Sprintf("- **%s**: %s", shortKey, v))
+		memType, shortKey := parseMemoryKey(k)
+		grouped[memType] = append(grouped[memType], mem{shortKey: shortKey, value: v})
 	}
 
-	if len(memories) == 0 {
+	if len(grouped) == 0 {
 		return
 	}
 
-	sort.Strings(memories)
+	// Sort each group by key
+	for t := range grouped {
+		sort.Slice(grouped[t], func(i, j int) bool {
+			return grouped[t][i].shortKey < grouped[t][j].shortKey
+		})
+	}
 
 	fmt.Println()
 	fmt.Println("# Agent Memories")
-	fmt.Println()
-	for _, m := range memories {
-		fmt.Println(m)
+
+	for _, t := range memoryTypeOrder {
+		mems, ok := grouped[t]
+		if !ok || len(mems) == 0 {
+			continue
+		}
+		label := memoryTypeLabels[t]
+		if label == "" {
+			label = t
+		}
+		fmt.Printf("\n## %s\n\n", label)
+		for _, m := range mems {
+			fmt.Printf("- **%s**: %s\n", m.shortKey, m.value)
+		}
 	}
 }
 
