@@ -23,6 +23,11 @@ Monitors Dolt commit growth across all production databases and escalates to
 the Mayor when history compaction or flatten is needed. This is a judgment
 call, not a hard threshold trigger.
 
+**⚠️ THIS IS A MONITORING-ONLY PLUGIN. DO NOT run `run.sh` or perform
+compaction directly.** Your job is to gather data, analyze it, and ESCALATE
+to the Mayor if compaction is warranted. The Mayor decides when and how to
+compact. Running compaction from a dog risks data loss from concurrent writes.
+
 **You are a dog agent (Claude). Gather the data below, then use your judgment
 to decide if maintenance is needed.** Consider:
 

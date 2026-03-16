@@ -23,6 +23,10 @@ DOLT_HOST="${DOLT_HOST:-127.0.0.1}"
 DOLT_PORT="${DOLT_PORT:-3307}"
 DOLT_USER="${DOLT_USER:-root}"
 COMMIT_THRESHOLD="${COMMIT_THRESHOLD:-500}"
+# Hard safety floor: never compact a database below this commit count,
+# regardless of --threshold or other arguments. Prevents AI agents from
+# compacting small databases based on judgment overrides.
+HARD_MINIMUM_COMMITS=100
 # Default: auto-discover production databases via SHOW DATABASES.
 # Override with --databases db1,db2,... for an explicit list.
 DEFAULT_DBS="auto"
@@ -173,7 +177,10 @@ while IFS= read -r DB; do
   log "  $DB: $COUNT commits"
   REPORT="${REPORT}${DB}: ${COUNT} commits\n"
 
-  if [[ "$COUNT" -ge "$COMMIT_THRESHOLD" ]]; then
+  if [[ "$COUNT" -lt "$HARD_MINIMUM_COMMITS" ]]; then
+    log "  $DB: SKIPPED (below hard minimum of $HARD_MINIMUM_COMMITS commits — safety floor)"
+    SKIPPED+=("$DB")
+  elif [[ "$COUNT" -ge "$COMMIT_THRESHOLD" ]]; then
     CANDIDATES+=("$DB:$COUNT")
   else
     SKIPPED+=("$DB")
